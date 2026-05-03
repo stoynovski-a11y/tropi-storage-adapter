@@ -1,4 +1,4 @@
-"""Tropi Storage Adapter — unified Dropbox / Microsoft Graph file storage."""
+"""Storage adapter — unified Dropbox / Microsoft Graph file storage."""
 from .adapter import StorageAdapter, get_adapter
 from .exceptions import (
     AuthError,

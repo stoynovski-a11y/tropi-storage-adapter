@@ -1,16 +1,16 @@
 # tropi-storage-adapter
 
-Unified storage adapter for Tropi services. Pick a backend at runtime via an env var; the rest of your code is identical.
+Unified storage adapter. Pick a backend at runtime via an env var; the rest of your code is identical.
 
 ```python
 from tropi_storage import get_adapter
 
 storage = get_adapter()  # Dropbox or M365 (SharePoint/Graph) — picked by STORAGE_BACKEND
-data = storage.read("/Co/foo.xlsx")
-storage.write("/Co/foo.xlsx", new_bytes)
+data = storage.read("/Documents/example.xlsx")
+storage.write("/Documents/example.xlsx", new_bytes)
 ```
 
-This is the strangler-fig layer for migrating ~13 Railway/Vercel services from Dropbox to Microsoft 365 (SharePoint).
+Supports gradual migration from Dropbox to Microsoft 365 (SharePoint) with no code changes in consuming services.
 
 ---
 
@@ -25,7 +25,7 @@ pip install -e .
 From GitHub (when published):
 
 ```bash
-pip install git+ssh://git@github.com/stoynovski-a11y/tropi-storage-adapter.git
+pip install git+https://github.com/your-org/tropi-storage-adapter.git
 ```
 
 ---
@@ -39,12 +39,12 @@ Copy `env.example` to `.env` (the `env.example` filename has no leading dot to k
 | `STORAGE_BACKEND` | always | `dropbox` (default) or `m365` |
 | `DROPBOX_APP_KEY` / `_APP_SECRET` / `_REFRESH_TOKEN` | `dropbox` | Refresh-token OAuth flow |
 | `M365_TENANT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` | `m365` | App registration for client-credentials flow |
-| `M365_SITE_HOSTNAME` | `m365` | e.g. `tropicommodity.sharepoint.com` |
-| `M365_SITE_PATH` | `m365` | e.g. `/sites/Multipack` (use `/sites/Playgroud` for testing) |
+| `M365_SITE_HOSTNAME` | `m365` | e.g. `yourcompany.sharepoint.com` |
+| `M365_SITE_PATH` | `m365` | e.g. `/sites/YourSite` |
 | `SENTRY_DSN` | optional | If set, captures unhandled exceptions automatically |
 | `LOG_LEVEL` | optional | `INFO` (default), `DEBUG`, etc. |
 | `STORAGE_MAX_RETRIES` | optional | Default `5` for transient errors |
-| `INTEGRATION_TESTS` | tests only | Set to `1` to run live tests against `Playgroud` |
+| `INTEGRATION_TESTS` | tests only | Set to `1` to run live tests against a real backend |
 
 Secrets must never be committed. `.env` is gitignored.
 
@@ -100,7 +100,7 @@ Every operation emits one structured JSON log line:
 
 ```json
 {"timestamp":"2026-05-03T08:42:11","level":"INFO","logger":"tropi_storage",
- "message":"read ok","backend":"m365","operation":"read","path":"/Co/foo.xlsx",
+ "message":"read ok","backend":"m365","operation":"read","path":"/Documents/example.xlsx",
  "duration_ms":124.3,"result":"success"}
 ```
 
@@ -123,10 +123,10 @@ pip install -e ".[dev]"
 pytest -v
 ```
 
-Unit tests use mocked SDKs / mocked `httpx.MockTransport`. Set `INTEGRATION_TESTS=1` and provide real M365 credentials to exercise live calls against the Playgroud SharePoint site.
+Unit tests use mocked SDKs / mocked `httpx.MockTransport`. Set `INTEGRATION_TESTS=1` and provide real M365 credentials to exercise live calls against a real SharePoint site.
 
 ---
 
 ## Migration sequence
 
-See `~/migration/dropbox-services-inventory.md` for the per-service rollout order. Recommended pilot: Metro Order Parser (read-only, two templates).
+Switch `STORAGE_BACKEND` per service in your deployment platform environment. Start with read-only services to validate before enabling writes.

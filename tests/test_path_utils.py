@@ -28,7 +28,7 @@ class TestExpandPath:
         assert "01" in expand_path("{ww}", when=d)
 
     def test_no_tokens_passthrough(self):
-        assert expand_path("/Co/foo.xlsx") == "/Co/foo.xlsx"
+        assert expand_path("/Documents/foo.xlsx") == "/Documents/foo.xlsx"
 
     def test_unknown_token_left_alone(self):
         # {x} is not a recognized token; must remain literal.

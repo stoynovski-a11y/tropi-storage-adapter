@@ -24,7 +24,7 @@ from .logging_config import configure_logging, init_sentry_if_configured
 class StorageAdapter(ABC):
     """Backend-agnostic file-storage interface.
 
-    All paths are POSIX-style, absolute, with a leading slash, e.g. `/Co/foo.xlsx`.
+    All paths are POSIX-style, absolute, with a leading slash, e.g. `/Documents/foo.xlsx`.
     Backends translate to their native path format internally.
     """
 

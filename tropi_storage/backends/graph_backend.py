@@ -439,7 +439,7 @@ class GraphBackend(StorageAdapter):
             self._request(
                 "POST",
                 self._item_id_url(item["id"], "/checkin"),
-                json={"comment": "tropi-storage-adapter checkin"},
+                json={"comment": "storage adapter checkin"},
             )
             self._held_locks.discard(p)
 

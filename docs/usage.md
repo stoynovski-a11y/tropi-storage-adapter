@@ -17,7 +17,7 @@ The factory reads `STORAGE_BACKEND` env var (`dropbox` or `m365`), initializes J
 ## Read a file
 
 ```python
-data = storage.read("/Co/A_23 TropiCommodity Acc Мере/DOCS/foo.xlsx")
+data = storage.read("/Documents/Reports/2024/foo.xlsx")
 print(len(data), "bytes")
 ```
 
@@ -29,7 +29,7 @@ Raises `NotFoundError` if missing.
 
 ```python
 new_bytes = open("/tmp/report.xlsx", "rb").read()
-meta = storage.write("/Co/foo/report.xlsx", new_bytes, overwrite=True)
+meta = storage.write("/Documents/reports/q1.xlsx", new_bytes, overwrite=True)
 print(meta["etag"], meta["size"])
 ```
 
@@ -40,7 +40,7 @@ Returns `{name, path, type, size, modified, content_hash, id, etag}`. Parent fol
 ## List a folder (paginated)
 
 ```python
-items = storage.list("/Co/foo", recursive=False)
+items = storage.list("/Documents/reports", recursive=False)
 for item in items:
     print(item["type"], item["name"], item["size"])
 ```
@@ -52,7 +52,7 @@ Pagination is handled internally — for huge folders, all pages are fetched. Us
 ## Delete (idempotent)
 
 ```python
-storage.delete("/Co/foo/old.xlsx")  # safe to call even if the file is gone
+storage.delete("/Documents/old/draft.xlsx")  # safe to call even if the file is gone
 ```
 
 ---
@@ -81,7 +81,7 @@ Creates every missing segment, ignores already-existing folders.
 ## Check a path without raising
 
 ```python
-meta = storage.get_metadata("/Co/maybe.xlsx")
+meta = storage.get_metadata("/Documents/maybe.xlsx")
 if meta["exists"]:
     print(meta["etag"], meta["size"])
 else:
@@ -97,9 +97,9 @@ Stop hardcoding `2025` / `2026` in every service:
 ```python
 from tropi_storage import expand_path
 
-template = "/2021 Имена Кодове/03 Продукция/{year} Ф1 Сведения Производство/{year}_{ww}_report.xlsx"
+template = "/Reports/{year}/week-{ww}/summary.xlsx"
 path = expand_path(template)
-# -> "/2021 Имена Кодове/03 Продукция/2026 Ф1 Сведения Производство/2026_18_report.xlsx"
+# -> "/Reports/2026/week-18/summary.xlsx"
 
 storage.write(path, data)
 ```
@@ -115,13 +115,13 @@ Optimistic concurrency — fail loudly if the file changed since you read it:
 ```python
 from tropi_storage import ConflictError
 
-meta = storage.get_metadata("/Co/register.xlsx")
-data = storage.read("/Co/register.xlsx")
+meta = storage.get_metadata("/Documents/register.xlsx")
+data = storage.read("/Documents/register.xlsx")
 
 # ... mutate data ...
 
 try:
-    storage.write_with_etag("/Co/register.xlsx", new_data, etag=meta["etag"])
+    storage.write_with_etag("/Documents/register.xlsx", new_data, etag=meta["etag"])
 except ConflictError:
     print("Someone else wrote the file. Re-read and retry.")
 ```
@@ -136,17 +136,17 @@ Prevents two services writing the same file at the same time.
 from tropi_storage import LockError
 
 try:
-    storage.checkout("/Каси/Каса Бургас/Каса_Бургас_Draft.xlsx")
+    storage.checkout("/Documents/shared/draft.xlsx")
 except LockError:
     print("Another instance is editing this file; try later.")
     return
 
 try:
-    data = storage.read("/Каси/Каса Бургас/Каса_Бургас_Draft.xlsx")
+    data = storage.read("/Documents/shared/draft.xlsx")
     # ... mutate ...
-    storage.write("/Каси/Каса Бургас/Каса_Бургас_Draft.xlsx", new_data)
+    storage.write("/Documents/shared/draft.xlsx", new_data)
 finally:
-    storage.checkin("/Каси/Каса Бургас/Каса_Бургас_Draft.xlsx")
+    storage.checkin("/Documents/shared/draft.xlsx")
 ```
 
 - **Graph backend**: native `POST /checkout` / `POST /checkin`. The file is hidden from other users until checkin.
@@ -193,10 +193,10 @@ STORAGE_BACKEND=m365
 M365_TENANT_ID=...
 M365_CLIENT_ID=...
 M365_CLIENT_SECRET=...
-M365_SITE_HOSTNAME=tropicommodity.sharepoint.com
-M365_SITE_PATH=/sites/Multipack
+M365_SITE_HOSTNAME=yourcompany.sharepoint.com
+M365_SITE_PATH=/sites/YourSite
 ```
 
-No code changes. Same paths (`/Co/...`) — the Graph backend translates them to `sites/{siteId}/drive/root:/Co/...` internally.
+No code changes. Same paths (`/Documents/...`) — the Graph backend translates them to `sites/{siteId}/drive/root:/Documents/...` internally.
 
-For the testing pilot, point at `/sites/Playgroud` instead of `/sites/Multipack`.
+For testing, point at a separate test site instead of your production site.

@@ -49,3 +49,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# Claude Code internal state
+.claude/

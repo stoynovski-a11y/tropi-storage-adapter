@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tropi-storage-adapter"
 version = "0.1.0"
-description = "Unified storage adapter for Tropi services — Dropbox and Microsoft 365 (SharePoint via Graph) backends behind a single interface."
+description = "Unified storage adapter exposing a single interface over Dropbox and Microsoft 365 (SharePoint via Graph) backends."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
-authors = [{ name = "Vaklin Stoynovski" }]
+authors = [{ name = "Storage Adapter Contributors" }]
 keywords = ["dropbox", "sharepoint", "graph", "storage", "adapter"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/stoynovski-a11y/tropi-storage-adapter"
+Homepage = "https://github.com/your-org/tropi-storage-adapter"
 
 [tool.setuptools.packages.find]
 where = ["."]
