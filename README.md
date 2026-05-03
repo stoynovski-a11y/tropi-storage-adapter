@@ -25,7 +25,7 @@ pip install -e .
 From GitHub (when published):
 
 ```bash
-pip install git+https://github.com/your-org/tropi-storage-adapter.git
+pip install git+https://github.com/stoynovski-a11y/tropi-storage-adapter.git
 ```
 
 ---
