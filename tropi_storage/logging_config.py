@@ -77,15 +77,23 @@ def get_logger() -> logging.Logger:
 def log_operation(backend: str, operation: str, path: str):
     """Time and log a single adapter operation.
 
-    Emits one INFO record on success and one ERROR record on exception.
+    Emits one INFO record on success and one ERROR (or WARNING) record on
+    exception. NotFoundError is logged at WARNING level — it's a normal
+    control-flow signal (caller probes a path that may or may not exist)
+    and shouldn't pollute Sentry with thousands of "missing file" events.
+    All other exceptions log at ERROR.
     """
+    from .exceptions import NotFoundError  # local import to avoid cycle
+
     logger = get_logger()
     start = time.perf_counter()
     try:
         yield
     except Exception as exc:
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger.error(
+        log_level = logging.WARNING if isinstance(exc, NotFoundError) else logging.ERROR
+        logger.log(
+            log_level,
             f"{operation} failed",
             extra={
                 "backend": backend,
