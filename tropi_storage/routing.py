@@ -37,6 +37,26 @@ DEFAULT_ROUTES: dict[str, tuple[str, str]] = {}
 
 
 # ---------------------------------------------------------------------------
+# load_strip_prefix
+# ---------------------------------------------------------------------------
+
+def load_strip_prefix() -> str | None:
+    """Return the legacy path prefix to strip, or None if not configured.
+
+    Reads ``M365_STRIP_PREFIX`` from the environment.  The value is stripped of
+    surrounding whitespace.  An empty (or whitespace-only) value is treated as
+    unset and returns None.
+
+    Example: if ``M365_STRIP_PREFIX=/Legacy`` then every path passed to
+    ``resolve_route`` that starts with ``/Legacy/`` is normalised to the
+    portion after ``/Legacy`` before routing decisions are made — so
+    ``/Legacy/Top A/x`` routes as if it were ``/Top A/x``.
+    """
+    val = os.getenv("M365_STRIP_PREFIX", "").strip()
+    return val if val else None
+
+
+# ---------------------------------------------------------------------------
 # load_routes
 # ---------------------------------------------------------------------------
 
@@ -89,18 +109,25 @@ def resolve_route(
     routes: dict[str, tuple[str, str]],
     default_site: Optional[str] = None,
     default_drive: Optional[str] = None,
+    strip_prefix: Optional[str] = None,
 ) -> tuple[str, Optional[str], str]:
     """Map *path* to (site_path, drive_name | None, item_path).
 
     Resolution rules
     ----------------
-    1. ``path == "/"``  — if *default_site* is given return
+    1. If *strip_prefix* is given, the leading prefix is removed from *path*
+       before any routing decision is made.  Paths that do not start with the
+       prefix are left unchanged (idempotent).  Example: prefix ``/Legacy``
+       turns ``/Legacy/Top A/sub/x.xlsx`` into routing on ``/Top A/sub/x.xlsx``.
+       A path equal to the prefix itself (e.g. ``/Legacy``) normalises to
+       ``"/"``.
+    2. ``path == "/"``  — if *default_site* is given return
        ``(default_site, default_drive, "/")``, otherwise raise BackendError.
-    2. First path segment present in *routes* → strip the segment and return
+    3. First path segment present in *routes* → strip the segment and return
        the configured (site_path, drive_name) with the remainder as item_path.
-    3. First path segment NOT in *routes* but *default_site* given → return
+    4. First path segment NOT in *routes* but *default_site* given → return
        the whole path under the default site/drive (backward-compat).
-    4. Otherwise raise BackendError.
+    5. Otherwise raise BackendError.
 
     Examples
     --------
@@ -113,6 +140,13 @@ def resolve_route(
     ("/sites/alpha", "Library A", "/")
     """
     p = normalize_path(path)
+
+    if strip_prefix:
+        pfx = "/" + strip_prefix.strip("/")
+        if p == pfx:
+            p = "/"
+        elif p.startswith(pfx + "/"):
+            p = p[len(pfx):]  # leaves a leading "/..."
 
     if p == "/":
         if default_site:
