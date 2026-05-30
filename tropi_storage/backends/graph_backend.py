@@ -5,10 +5,19 @@ This is a deliberate divergence from the spec's `msgraph-sdk` recommendation —
 the official SDK is async-first (Kiota-generated) and would force every adapter
 call through `asyncio.run()`, which is awkward for the existing sync services.
 The functionality is identical; only the transport differs.
+
+Multi-site routing
+------------------
+The first path segment selects a (site_path, library_name) pair via
+`tropi_storage.routing`.  Paths whose first segment is not in the route table
+fall back to the default site/drive configured via `M365_SITE_PATH` and
+`M365_DEFAULT_LIBRARY`.  Services that were written before routing was added
+therefore continue to work without changes.
 """
 from __future__ import annotations
 
 import os
+import threading
 import time
 import urllib.parse
 from typing import Any
@@ -28,6 +37,7 @@ from ..exceptions import (
 from ..logging_config import log_operation
 from ..path_utils import normalize_path, split_parent
 from ..retry import retry_on_transient
+from ..routing import load_routes, resolve_route
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = ["https://graph.microsoft.com/.default"]
@@ -85,7 +95,14 @@ _TRANSIENT = (
 
 
 class GraphBackend(StorageAdapter):
-    """SharePoint document library accessed via Microsoft Graph."""
+    """SharePoint document library accessed via Microsoft Graph.
+
+    ``site_path`` is now **optional**.  When omitted, every logical path
+    *must* match a route in ``self._routes`` (populated from
+    ``DEFAULT_ROUTES`` + optional ``M365_ROUTES`` env var); unmatched paths
+    raise ``BackendError``.  If a default site is configured it acts as a
+    catch-all for unmatched paths, preserving backward-compatibility.
+    """
 
     backend_name = "m365"
 
@@ -103,13 +120,19 @@ class GraphBackend(StorageAdapter):
         self._client_id = client_id or os.getenv("M365_CLIENT_ID", "")
         self._client_secret = client_secret or os.getenv("M365_CLIENT_SECRET", "")
         self._site_hostname = site_hostname or os.getenv("M365_SITE_HOSTNAME", "")
-        self._site_path = site_path or os.getenv("M365_SITE_PATH", "")
+
+        # site_path is optional — if absent, all paths must match a route.
+        _sp = site_path or os.getenv("M365_SITE_PATH", "") or None
+        self._default_site_path: str | None = _sp
+
+        # Named library to use for the default site (optional).
+        self._default_drive_name: str | None = os.getenv("M365_DEFAULT_LIBRARY") or None
 
         if not all([self._tenant_id, self._client_id, self._client_secret,
-                    self._site_hostname, self._site_path]):
+                    self._site_hostname]):
             raise AuthError(
                 "Graph backend requires M365_TENANT_ID, M365_CLIENT_ID, "
-                "M365_CLIENT_SECRET, M365_SITE_HOSTNAME, M365_SITE_PATH env vars."
+                "M365_CLIENT_SECRET, M365_SITE_HOSTNAME env vars."
             )
 
         self._http: httpx.Client = http_client or httpx.Client(timeout=60.0)
@@ -117,10 +140,17 @@ class GraphBackend(StorageAdapter):
         self._token: str | None = None
         self._token_expires_at: float = 0.0
 
-        # Cached on first use.
-        self._site_id: str | None = None
-        self._drive_id: str | None = None
+        # Per-(site_path) site-id cache and per-(site_path, drive_name) drive-id cache.
+        # Both are guarded by a lock because APScheduler threads may call concurrently.
+        self._site_id_cache: dict[str, str] = {}
+        self._drive_id_cache: dict[tuple[str, str | None], str] = {}
+        self._cache_lock = threading.Lock()
+
+        # Lock-tracking (used by checkout/checkin).
         self._held_locks: set[str] = set()
+
+        # Route table: first-segment → (site_path, library_name).
+        self._routes = load_routes()
 
     # --- auth --------------------------------------------------------------
     def _get_msal(self) -> msal.ConfidentialClientApplication:
@@ -133,7 +163,7 @@ class GraphBackend(StorageAdapter):
         return self._msal_app
 
     def _get_token(self) -> str:
-        # Refresh ~60s before expiry.
+        # Refresh ~60 s before expiry.
         now = time.time()
         if self._token and now < self._token_expires_at - 60:
             return self._token
@@ -165,36 +195,113 @@ class GraphBackend(StorageAdapter):
             raise _http_to_storage_error(resp)
         return resp
 
-    # --- site/drive resolution --------------------------------------------
-    def _resolve_site_and_drive(self) -> tuple[str, str]:
-        if self._site_id and self._drive_id:
-            return self._site_id, self._drive_id
-        # GET /sites/{hostname}:{site-path}
-        site_path = self._site_path if self._site_path.startswith("/") else "/" + self._site_path
-        url = f"/sites/{self._site_hostname}:{site_path}"
+    # --- site/drive resolution (multi-site, cached) -----------------------
+
+    def _resolve_site_id(self, site_path: str) -> str:
+        """Return the Graph site id for *site_path*, using the cache."""
+        with self._cache_lock:
+            if site_path in self._site_id_cache:
+                return self._site_id_cache[site_path]
+
+        sp = site_path if site_path.startswith("/") else "/" + site_path
+        url = f"/sites/{self._site_hostname}:{sp}"
         site = self._request("GET", url).json()
-        self._site_id = site["id"]
-        drive = self._request("GET", f"/sites/{self._site_id}/drive").json()
-        self._drive_id = drive["id"]
-        return self._site_id, self._drive_id
+        site_id: str = site["id"]
+
+        with self._cache_lock:
+            self._site_id_cache[site_path] = site_id
+        return site_id
+
+    def _resolve_drive_id(self, site_path: str, drive_name: str | None) -> str:
+        """Return the Graph drive id for the given site + library name.
+
+        If *drive_name* is falsy the site's default drive is used.
+        Raises BackendError if a named library cannot be found.
+        """
+        key = (site_path, drive_name)
+        with self._cache_lock:
+            if key in self._drive_id_cache:
+                return self._drive_id_cache[key]
+
+        site_id = self._resolve_site_id(site_path)
+
+        if not drive_name:
+            # Default drive.
+            drive = self._request("GET", f"/sites/{site_id}/drive").json()
+            drive_id: str = drive["id"]
+        else:
+            # Walk (paginated) drives list to find matching library by name.
+            drive_id = self._find_drive_by_name(site_id, site_path, drive_name)
+
+        with self._cache_lock:
+            self._drive_id_cache[key] = drive_id
+        return drive_id
+
+    def _find_drive_by_name(self, site_id: str, site_path: str, drive_name: str) -> str:
+        """Paginate /sites/{site_id}/drives until ``drive_name`` is found."""
+        url: str = f"/sites/{site_id}/drives"
+        while url:
+            resp = self._request("GET", url).json()
+            for entry in resp.get("value", []):
+                if entry.get("name") == drive_name:
+                    return entry["id"]
+            next_link: str = resp.get("@odata.nextLink", "")
+            if next_link and next_link.startswith(GRAPH_BASE):
+                next_link = next_link[len(GRAPH_BASE):]
+            url = next_link
+        raise BackendError(
+            f"Library {drive_name!r} not found in site {site_path!r}."
+        )
+
+    def _resolve_default_site_and_drive(self) -> tuple[str, str]:
+        """Resolve the default site + drive ids.  Raises BackendError if no default configured."""
+        if not self._default_site_path:
+            raise BackendError(
+                "No default site configured (M365_SITE_PATH) and no route matched."
+            )
+        drive_id = self._resolve_drive_id(self._default_site_path, self._default_drive_name)
+        site_id = self._resolve_site_id(self._default_site_path)
+        return site_id, drive_id
+
+    # Thin backward-compat alias used only by the old TestSiteResolution test.
+    def _resolve_site_and_drive(self) -> tuple[str, str]:
+        """Backward-compatible: resolve the *default* site+drive ids."""
+        return self._resolve_default_site_and_drive()
+
+    # --- routing helpers ---------------------------------------------------
+
+    def _route(self, path: str) -> tuple[str, str]:
+        """Resolve *path* to (drive_id, item_path) via the route table."""
+        site_path, drive_name, item_path = resolve_route(
+            path, self._routes, self._default_site_path, self._default_drive_name
+        )
+        drive_id = self._resolve_drive_id(site_path, drive_name)
+        return drive_id, item_path
+
+    # --- URL builders, drive-aware ----------------------------------------
 
     @staticmethod
     def _encode_path(path: str) -> str:
-        """Encode a folder/file path for use after `root:`."""
-        # Path segments are URL-encoded; '/' separators are preserved.
+        """Encode a folder/file path for use after ``root:``."""
         return urllib.parse.quote(path.lstrip("/"), safe="/")
 
-    def _item_url(self, path: str, suffix: str = "") -> str:
-        """Build /drives/{id}/root:/path/to/file:[suffix]."""
-        _, drive_id = self._resolve_site_and_drive()
-        p = normalize_path(path)
+    def _build_item_url(self, drive_id: str, item_path: str, suffix: str = "") -> str:
+        """Return a /drives/{drive_id}/root[:/path][:suffix] URL fragment."""
+        p = normalize_path(item_path)
         if p == "/":
-            return f"/drives/{drive_id}/root{suffix}" if not suffix else f"/drives/{drive_id}/root{suffix}"
-        encoded = self._encode_path(p)
-        return f"/drives/{drive_id}/root:/{encoded}:{suffix}" if suffix else f"/drives/{drive_id}/root:/{encoded}"
+            return f"/drives/{drive_id}/root{suffix}"
+        enc = self._encode_path(p)
+        if suffix:
+            return f"/drives/{drive_id}/root:/{enc}:{suffix}"
+        return f"/drives/{drive_id}/root:/{enc}"
 
-    def _item_id_url(self, item_id: str, suffix: str = "") -> str:
-        _, drive_id = self._resolve_site_and_drive()
+    def _item_url(self, path: str, suffix: str = "") -> str:
+        """Route *path* then build /drives/{id}/root:/path:[suffix]."""
+        drive_id, ip = self._route(path)
+        return self._build_item_url(drive_id, ip, suffix)
+
+    def _item_id_url(self, drive_id: str, item_id: str, suffix: str = "") -> str:
+        """Return /drives/{drive_id}/items/{item_id}{suffix}."""
         return f"/drives/{drive_id}/items/{item_id}{suffix}"
 
     @staticmethod
@@ -221,6 +328,25 @@ class GraphBackend(StorageAdapter):
             "id": item.get("id"),
             "etag": item.get("cTag") or item.get("eTag"),
         }
+
+    # --- item helpers -------------------------------------------------------
+
+    def _get_item(self, path: str) -> dict:
+        """Fetch the Graph item metadata for *path*."""
+        drive_id, ip = self._route(path)
+        if ip == "/":
+            return self._request("GET", f"/drives/{drive_id}/root").json()
+        return self._request("GET", self._build_item_url(drive_id, ip)).json()
+
+    def _get_item_or_none(self, drive_id: str, item_path: str) -> dict | None:
+        """Fetch item metadata; return None on 404."""
+        try:
+            p = normalize_path(item_path)
+            if p == "/":
+                return self._request("GET", f"/drives/{drive_id}/root").json()
+            return self._request("GET", self._build_item_url(drive_id, p)).json()
+        except NotFoundError:
+            return None
 
     # --- core ops ----------------------------------------------------------
     @retry_on_transient(transient_exceptions=_TRANSIENT)
@@ -295,7 +421,10 @@ class GraphBackend(StorageAdapter):
                 d = self._entry_to_dict(item)
                 results.append(d)
                 if recursive and d["type"] == "folder":
-                    child_path = path.rstrip("/") + "/" + d["name"] if path != "/" else "/" + d["name"]
+                    # Build child logical path so routing re-applies.
+                    child_path = (
+                        path.rstrip("/") + "/" + d["name"] if path != "/" else "/" + d["name"]
+                    )
                     results.extend(self._list_inner(child_path, recursive=True))
             url = resp.get("@odata.nextLink", "")
             # nextLink is a full URL; bypass the GRAPH_BASE prefix.
@@ -317,6 +446,13 @@ class GraphBackend(StorageAdapter):
         s = normalize_path(src)
         d = normalize_path(dst)
         with log_operation(self.backend_name, "move", f"{s} -> {d}"):
+            # Cross-library moves are not supported by a single PATCH.
+            src_drive, _ = self._route(s)
+            dst_drive, _ = self._route(d)
+            if src_drive != dst_drive:
+                raise BackendError(
+                    "Cross-library move is not supported; use copy + delete instead."
+                )
             self._ensure_parent(d)
             dst_parent, dst_name = split_parent(d)
             parent_meta = self._get_item(dst_parent)
@@ -335,8 +471,11 @@ class GraphBackend(StorageAdapter):
             dst_parent, dst_name = split_parent(d)
             parent_meta = self._get_item(dst_parent)
             body = {
-                "parentReference": {"driveId": parent_meta["parentReference"]["driveId"],
-                                    "id": parent_meta["id"]},
+                "parentReference": {
+                    "driveId": parent_meta.get("parentReference", {}).get("driveId")
+                               or parent_meta.get("parentReference", {}).get("id"),
+                    "id": parent_meta["id"],
+                },
                 "name": dst_name,
             }
             # Graph copy is async — returns 202 with Location header to poll.
@@ -369,22 +508,27 @@ class GraphBackend(StorageAdapter):
             self._ensure_folder_recursive(p)
 
     def _ensure_folder_recursive(self, path: str) -> None:
-        # Walk from root creating each missing segment.
-        segments = [s for s in path.split("/") if s]
-        current = ""
-        _, drive_id = self._resolve_site_and_drive()
+        """Create each missing folder segment under the correct library drive."""
+        drive_id, item_path = self._route(path)
+        if item_path == "/":
+            return  # Library root always exists.
+
+        segments = [s for s in item_path.split("/") if s]
+        current_item_path = ""
         for seg in segments:
-            parent = current or "/"
-            current = current + "/" + seg
-            existing = self._get_item_or_none(current)
+            parent_item_path = current_item_path or "/"
+            current_item_path = current_item_path + "/" + seg
+            existing = self._get_item_or_none(drive_id, current_item_path)
             if existing and "folder" in existing:
                 continue
             if existing and "file" in existing:
-                raise BackendError(f"{current} exists as a file, cannot create folder")
-            if parent == "/":
+                raise BackendError(
+                    f"{current_item_path} exists as a file, cannot create folder"
+                )
+            if parent_item_path == "/":
                 children_url = f"/drives/{drive_id}/root/children"
             else:
-                children_url = self._item_url(parent, "/children")
+                children_url = self._build_item_url(drive_id, parent_item_path, "/children")
             body = {
                 "name": seg,
                 "folder": {},
@@ -396,19 +540,6 @@ class GraphBackend(StorageAdapter):
         parent, _ = split_parent(path)
         if parent and parent != "/":
             self._ensure_folder_recursive(parent)
-
-    def _get_item(self, path: str) -> dict:
-        p = normalize_path(path)
-        if p == "/":
-            _, drive_id = self._resolve_site_and_drive()
-            return self._request("GET", f"/drives/{drive_id}/root").json()
-        return self._request("GET", self._item_url(p)).json()
-
-    def _get_item_or_none(self, path: str) -> dict | None:
-        try:
-            return self._get_item(path)
-        except NotFoundError:
-            return None
 
     @retry_on_transient(transient_exceptions=_TRANSIENT)
     def get_metadata(self, path: str) -> dict:
@@ -428,7 +559,8 @@ class GraphBackend(StorageAdapter):
         p = normalize_path(path)
         with log_operation(self.backend_name, "checkout", p):
             item = self._get_item(p)
-            self._request("POST", self._item_id_url(item["id"], "/checkout"))
+            drive_id, _ = self._route(p)
+            self._request("POST", self._item_id_url(drive_id, item["id"], "/checkout"))
             self._held_locks.add(p)
 
     @retry_on_transient(transient_exceptions=_TRANSIENT)
@@ -436,9 +568,10 @@ class GraphBackend(StorageAdapter):
         p = normalize_path(path)
         with log_operation(self.backend_name, "checkin", p):
             item = self._get_item(p)
+            drive_id, _ = self._route(p)
             self._request(
                 "POST",
-                self._item_id_url(item["id"], "/checkin"),
+                self._item_id_url(drive_id, item["id"], "/checkin"),
                 json={"comment": "storage adapter checkin"},
             )
             self._held_locks.discard(p)
@@ -471,8 +604,15 @@ class GraphBackend(StorageAdapter):
         except Exception:
             pass
         try:
-            self._resolve_site_and_drive()
-            self._request("GET", self._item_url("/", "/children") + "?$top=1")
+            # Pick an appropriate probe path.
+            probe_env = os.getenv("M365_HEALTHCHECK_PATH", "").strip()
+            if probe_env:
+                probe_path = probe_env
+            elif self._routes:
+                probe_path = "/" + next(iter(self._routes))
+            else:
+                probe_path = "/"
+            self.list(probe_path)
             can_list_root = True
         except Exception:
             pass
