@@ -13,7 +13,7 @@ import pytest
 
 from tropi_storage.backends.graph_backend import GraphBackend
 from tropi_storage.exceptions import BackendError
-from tropi_storage.routing import DEFAULT_ROUTES, load_routes, resolve_route
+from tropi_storage.routing import DEFAULT_ROUTES, load_routes, load_strip_prefix, resolve_route
 
 # ---------------------------------------------------------------------------
 # Helpers (same pattern as test_graph_backend.py)
@@ -323,3 +323,102 @@ class TestBackCompat:
         assert default_drive_id in captured["url"]
         # Full logical path preserved (no stripping) — first segment kept.
         assert "SomeUnroutedFolder" in captured["url"]
+
+
+# ---------------------------------------------------------------------------
+# 6. strip_prefix tests
+# ---------------------------------------------------------------------------
+
+class TestStripPrefix:
+    """Tests for the strip_prefix parameter of resolve_route."""
+
+    def test_strip_prefix_routes_correctly(self):
+        """/Legacy/Top A/sub/x.xlsx routes as if it were /Top A/sub/x.xlsx."""
+        site, drive, item = resolve_route(
+            "/Legacy/Top A/sub/x.xlsx", _SAMPLE_ROUTES, strip_prefix="/Legacy"
+        )
+        assert site == "/sites/alpha"
+        assert drive == "Library A"
+        assert item == "/sub/x.xlsx"
+
+    def test_strip_prefix_without_leading_slash(self):
+        """Prefix supplied without leading slash is normalised — same result."""
+        site, drive, item = resolve_route(
+            "/Legacy/Top B/doc.xlsx", _SAMPLE_ROUTES, strip_prefix="Legacy"
+        )
+        assert site == "/sites/beta"
+        assert drive == "Library B"
+        assert item == "/doc.xlsx"
+
+    def test_strip_prefix_with_trailing_slash(self):
+        """Prefix supplied with trailing slash is normalised — same result."""
+        site, drive, item = resolve_route(
+            "/Legacy/Top A/file.xlsx", _SAMPLE_ROUTES, strip_prefix="/Legacy/"
+        )
+        assert site == "/sites/alpha"
+        assert drive == "Library A"
+        assert item == "/file.xlsx"
+
+    def test_path_equal_to_prefix_becomes_root(self):
+        """A path exactly equal to the prefix normalises to '/' (root)."""
+        site, drive, item = resolve_route(
+            "/Legacy",
+            _SAMPLE_ROUTES,
+            strip_prefix="/Legacy",
+            default_site="/sites/fallback",
+            default_drive="FallbackLib",
+        )
+        assert site == "/sites/fallback"
+        assert item == "/"
+
+    def test_no_strip_prefix_unchanged(self):
+        """Without strip_prefix the original routing is unaffected."""
+        site, drive, item = resolve_route(
+            "/Top A/sub/x.xlsx", _SAMPLE_ROUTES
+        )
+        assert site == "/sites/alpha"
+        assert item == "/sub/x.xlsx"
+
+    def test_non_matching_prefix_is_noop(self):
+        """A path that does NOT start with the prefix is routed as-is."""
+        site, drive, item = resolve_route(
+            "/Top B/sub/x.xlsx", _SAMPLE_ROUTES, strip_prefix="/Legacy"
+        )
+        assert site == "/sites/beta"
+        assert drive == "Library B"
+        assert item == "/sub/x.xlsx"
+
+    def test_partial_prefix_match_is_noop(self):
+        """A prefix that is a partial match (not a whole segment boundary) is not stripped."""
+        # "/Leg" should NOT strip "/Legacy/..." — they don't share a segment boundary
+        site, drive, item = resolve_route(
+            "/Top A/x.xlsx", _SAMPLE_ROUTES, strip_prefix="/Leg"
+        )
+        assert site == "/sites/alpha"
+        assert item == "/x.xlsx"
+
+
+# ---------------------------------------------------------------------------
+# 7. load_strip_prefix tests
+# ---------------------------------------------------------------------------
+
+class TestLoadStripPrefix:
+    def test_env_set_returns_value(self, monkeypatch):
+        monkeypatch.setenv("M365_STRIP_PREFIX", "/Legacy")
+        assert load_strip_prefix() == "/Legacy"
+
+    def test_env_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("M365_STRIP_PREFIX", raising=False)
+        assert load_strip_prefix() is None
+
+    def test_env_empty_string_returns_none(self, monkeypatch):
+        monkeypatch.setenv("M365_STRIP_PREFIX", "")
+        assert load_strip_prefix() is None
+
+    def test_env_whitespace_only_returns_none(self, monkeypatch):
+        monkeypatch.setenv("M365_STRIP_PREFIX", "   ")
+        assert load_strip_prefix() is None
+
+    def test_env_value_stripped_of_whitespace(self, monkeypatch):
+        monkeypatch.setenv("M365_STRIP_PREFIX", "  /Legacy  ")
+        assert load_strip_prefix() == "/Legacy"

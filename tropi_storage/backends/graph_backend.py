@@ -37,7 +37,7 @@ from ..exceptions import (
 from ..logging_config import log_operation
 from ..path_utils import normalize_path, split_parent
 from ..retry import retry_on_transient
-from ..routing import load_routes, resolve_route
+from ..routing import load_routes, load_strip_prefix, resolve_route
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = ["https://graph.microsoft.com/.default"]
@@ -151,6 +151,9 @@ class GraphBackend(StorageAdapter):
 
         # Route table: first-segment → (site_path, library_name).
         self._routes = load_routes()
+
+        # Optional legacy-prefix to strip from every path before routing.
+        self._strip_prefix = load_strip_prefix()
 
     # --- auth --------------------------------------------------------------
     def _get_msal(self) -> msal.ConfidentialClientApplication:
@@ -273,7 +276,8 @@ class GraphBackend(StorageAdapter):
     def _route(self, path: str) -> tuple[str, str]:
         """Resolve *path* to (drive_id, item_path) via the route table."""
         site_path, drive_name, item_path = resolve_route(
-            path, self._routes, self._default_site_path, self._default_drive_name
+            path, self._routes, self._default_site_path, self._default_drive_name,
+            strip_prefix=self._strip_prefix,
         )
         drive_id = self._resolve_drive_id(site_path, drive_name)
         return drive_id, item_path
