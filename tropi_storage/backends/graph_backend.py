@@ -419,17 +419,27 @@ class GraphBackend(StorageAdapter):
     def _list_inner(self, path: str, recursive: bool) -> list[dict]:
         url = self._item_url(path, "/children")
         results: list[dict] = []
+        base = normalize_path(path)
         while url:
             resp = self._request("GET", url).json()
             for item in resp.get("value", []):
                 d = self._entry_to_dict(item)
+                # Return the *logical* path (caller namespace + name), not the
+                # drive-relative path that Graph's parentReference yields. Under
+                # multi-site routing the leading route segment is consumed during
+                # resolution, so a drive-relative path would NOT round-trip back
+                # through read()/move()/copy() — it would fall through to the
+                # default site and 404 ("Requested site could not be found").
+                # Rebuilding from the caller's input path keeps list() output
+                # usable as input to every other op. (No-op for single-site,
+                # where base already equals the drive-relative parent.)
+                d["path"] = (
+                    base.rstrip("/") + "/" + d["name"] if base != "/" else "/" + d["name"]
+                )
                 results.append(d)
                 if recursive and d["type"] == "folder":
-                    # Build child logical path so routing re-applies.
-                    child_path = (
-                        path.rstrip("/") + "/" + d["name"] if path != "/" else "/" + d["name"]
-                    )
-                    results.extend(self._list_inner(child_path, recursive=True))
+                    # Recurse on the logical child path so routing re-applies.
+                    results.extend(self._list_inner(d["path"], recursive=True))
             url = resp.get("@odata.nextLink", "")
             # nextLink is a full URL; bypass the GRAPH_BASE prefix.
             if url and url.startswith(GRAPH_BASE):

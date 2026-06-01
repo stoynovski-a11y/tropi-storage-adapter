@@ -229,6 +229,32 @@ class TestList:
         items = backend.list("/x")
         assert [i["name"] for i in items] == ["a", "b"]
 
+    def test_multisite_path_round_trips(self, env, fake_token, monkeypatch):
+        """Listed paths under a routed site must include the route segment so
+        they round-trip back through read()/move(). Regression: drive-relative
+        paths (without the segment) fell through to the default site and 404'd.
+        """
+        monkeypatch.setenv("M365_ROUTES", '{"TopA": ["/sites/alpha", "LibA"]}')
+        ALPHA_SITE_ID, ALPHA_DRIVE_ID = "alpha-site-id", "alpha-drive-id"
+        routes = {
+            ("GET", "/sites/x.sharepoint.com:/sites/alpha"): httpx.Response(
+                200, json={"id": ALPHA_SITE_ID, "name": "alpha"}),
+            ("GET", f"/sites/{ALPHA_SITE_ID}/drives"): httpx.Response(200, json={
+                "value": [{"id": ALPHA_DRIVE_ID, "name": "LibA"}]}),
+            ("GET", f"/drives/{ALPHA_DRIVE_ID}/root:/sub:/children"): httpx.Response(
+                200, json={"value": [
+                    {"id": "1", "name": "file.xlsx", "size": 10, "cTag": "c1",
+                     "lastModifiedDateTime": "2026-05-03T12:00:00Z",
+                     "file": {"hashes": {}},
+                     # Graph reports the *drive-relative* parent (no route segment).
+                     "parentReference": {"path": "/drive/root:/sub"}},
+                ]}),
+        }
+        backend = make_backend(routes, env, fake_token)
+        items = backend.list("/TopA/sub")
+        # Logical path keeps the "TopA" route segment, not the bare "/sub/...".
+        assert items[0]["path"] == "/TopA/sub/file.xlsx"
+
 
 class TestDelete:
     def test_basic(self, env, fake_token):
