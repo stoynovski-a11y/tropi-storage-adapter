@@ -279,6 +279,40 @@ class TestDelete:
         backend.delete("/missing")  # no exception
 
 
+class TestMove:
+    def test_move_with_rename_uses_item_id(self, env, fake_token):
+        """A move that also renames (autorename-on-conflict → 'src (1).pdf')
+        must PATCH the source by item id, never by path — Graph rejects a
+        name-change on a path-addressed item."""
+        import json
+
+        patched = {}
+
+        def patch_handler(req):
+            patched["url"] = str(req.url)
+            patched["body"] = json.loads(req.content)
+            return httpx.Response(200, json={"id": "srcid", "name": "src (1).pdf"})
+
+        routes = {
+            **site_drive_routes(),
+            # destination parent folder exists (used by ensure-parent + _get_item)
+            ("GET", "/root:/dst-folder"): httpx.Response(
+                200, json={"id": "dstfolder", "name": "dst-folder", "folder": {}}),
+            # source item → resolve its id
+            ("GET", "/root:/src.pdf"): httpx.Response(
+                200, json={"id": "srcid", "name": "src.pdf", "file": {}}),
+            # the move PATCH must hit the item-id URL, not the path URL
+            ("PATCH", f"/drives/{FAKE_DRIVE_ID}/items/srcid"): patch_handler,
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend.move("/src.pdf", "/dst-folder/src (1).pdf")
+
+        assert "/items/srcid" in patched["url"]
+        assert "/root:/src.pdf" not in patched["url"]  # NOT path-addressed
+        assert patched["body"]["name"] == "src (1).pdf"
+        assert patched["body"]["parentReference"]["id"] == "dstfolder"
+
+
 class TestEnsureFolder:
     def test_creates_when_missing(self, env, fake_token):
         creates = []

@@ -470,11 +470,20 @@ class GraphBackend(StorageAdapter):
             self._ensure_parent(d)
             dst_parent, dst_name = split_parent(d)
             parent_meta = self._get_item(dst_parent)
+            # Address the SOURCE by item id, not by path.  Graph rejects a PATCH
+            # that renames an item while it is addressed by path
+            # ("The name from body should match the name specified in the url"),
+            # so a move-with-rename (e.g. autorename-on-conflict → "foo (1).pdf")
+            # fails.  Resolving the id first makes both plain moves and
+            # move-with-rename work.
+            src_meta = self._get_item(s)
             body = {
                 "parentReference": {"id": parent_meta["id"]},
                 "name": dst_name,
             }
-            self._request("PATCH", self._item_url(s), json=body)
+            self._request(
+                "PATCH", self._item_id_url(src_drive, src_meta["id"]), json=body
+            )
 
     @retry_on_transient(transient_exceptions=_TRANSIENT)
     def copy(self, src: str, dst: str) -> None:
