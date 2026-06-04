@@ -7,8 +7,21 @@ from tropi_storage import StorageAdapter, get_adapter
 
 
 class TestGetAdapter:
-    def test_dropbox_default(self, monkeypatch):
-        # Provide minimal Dropbox env so DropboxBackend.__init__ doesn't raise.
+    def test_defaults_to_m365_when_unset(self, monkeypatch):
+        # An unset STORAGE_BACKEND must default to m365, never the legacy
+        # Dropbox backend (the old default caused silent Dropbox fallbacks).
+        monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+        monkeypatch.setenv("M365_TENANT_ID", "fake-tenant")
+        monkeypatch.setenv("M365_CLIENT_ID", "fake-client")
+        monkeypatch.setenv("M365_CLIENT_SECRET", "fake-secret")
+        monkeypatch.setenv("M365_SITE_HOSTNAME", "x.sharepoint.com")
+        monkeypatch.setenv("M365_SITE_PATH", "/sites/X")
+        adapter = get_adapter()
+        assert isinstance(adapter, StorageAdapter)
+        assert adapter.backend_name == "m365"
+
+    def test_dropbox_explicit(self, monkeypatch):
+        # Dropbox backend is retained for explicit rollback only.
         monkeypatch.setenv("STORAGE_BACKEND", "dropbox")
         monkeypatch.setenv("DROPBOX_APP_KEY", "fake-key")
         monkeypatch.setenv("DROPBOX_APP_SECRET", "fake-secret")

@@ -104,7 +104,12 @@ def get_adapter() -> StorageAdapter:
     configure_logging()
     init_sentry_if_configured()
 
-    backend = os.getenv("STORAGE_BACKEND", "dropbox").strip().lower()
+    # Default to m365: every deployed service runs on Microsoft 365, and an
+    # unset/typo'd STORAGE_BACKEND must never silently fall back to the
+    # decommissioned Dropbox path (that fallback caused live "not_found"
+    # failures during the migration). Dropbox stays available for explicit
+    # rollback (STORAGE_BACKEND=dropbox).
+    backend = os.getenv("STORAGE_BACKEND", "m365").strip().lower()
     if backend == "dropbox":
         # Local imports to avoid pulling SDK dependencies when unused.
         from .backends.dropbox_backend import DropboxBackend
