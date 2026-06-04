@@ -93,6 +93,15 @@ _TRANSIENT = (
     httpx.RemoteProtocolError,
 )
 
+# SharePoint's path index is eventually consistent: right after a file is
+# uploaded or moved, a path that exists can briefly 404. move() resolves items
+# by path, so it retries those lookups a few times (0.5 + 1.0 + 2.0 = 3.5s max)
+# before treating a 404 as a genuine missing file. This is NOT applied to
+# read/list, where a 404 should fail fast.
+_PATH_SETTLE_RETRIES = 4
+_PATH_SETTLE_BASE = 0.5
+_PATH_SETTLE_CAP = 2.0
+
 
 class GraphBackend(StorageAdapter):
     """SharePoint document library accessed via Microsoft Graph.
@@ -342,6 +351,23 @@ class GraphBackend(StorageAdapter):
             return self._request("GET", f"/drives/{drive_id}/root").json()
         return self._request("GET", self._build_item_url(drive_id, ip)).json()
 
+    def _get_item_settling(self, path: str) -> dict:
+        """Like _get_item, but retries briefly on a transient 404.
+
+        SharePoint's path index can lag right after a file is written or moved,
+        404-ing a path that exists. A few short, backed-off retries let it
+        settle before the 404 is treated as a genuine missing file.
+        """
+        delay = _PATH_SETTLE_BASE
+        for attempt in range(_PATH_SETTLE_RETRIES):
+            try:
+                return self._get_item(path)
+            except NotFoundError:
+                if attempt == _PATH_SETTLE_RETRIES - 1:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, _PATH_SETTLE_CAP)
+
     def _get_item_or_none(self, drive_id: str, item_path: str) -> dict | None:
         """Fetch item metadata; return None on 404."""
         try:
@@ -469,14 +495,14 @@ class GraphBackend(StorageAdapter):
                 )
             self._ensure_parent(d)
             dst_parent, dst_name = split_parent(d)
-            parent_meta = self._get_item(dst_parent)
+            parent_meta = self._get_item_settling(dst_parent)
             # Address the SOURCE by item id, not by path.  Graph rejects a PATCH
             # that renames an item while it is addressed by path
             # ("The name from body should match the name specified in the url"),
             # so a move-with-rename (e.g. autorename-on-conflict → "foo (1).pdf")
             # fails.  Resolving the id first makes both plain moves and
             # move-with-rename work.
-            src_meta = self._get_item(s)
+            src_meta = self._get_item_settling(s)
             body = {
                 "parentReference": {"id": parent_meta["id"]},
                 "name": dst_name,

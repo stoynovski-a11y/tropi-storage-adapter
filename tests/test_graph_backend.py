@@ -312,6 +312,55 @@ class TestMove:
         assert patched["body"]["name"] == "src (1).pdf"
         assert patched["body"]["parentReference"]["id"] == "dstfolder"
 
+    def test_move_retries_transient_404_on_source(self, env, fake_token, monkeypatch):
+        """SharePoint can 404 the source path right after the file lands in the
+        folder (index lag). move() should retry the lookup and succeed once the
+        path settles, instead of failing the archive."""
+        monkeypatch.setattr(
+            "tropi_storage.backends.graph_backend.time.sleep", lambda *_: None)
+        src_calls = {"n": 0}
+
+        def src_handler(req):
+            src_calls["n"] += 1
+            if src_calls["n"] == 1:  # first lookup 404s, then the path settles
+                return httpx.Response(404, json={"error": {"message": "not found"}})
+            return httpx.Response(200, json={"id": "srcid", "name": "src.pdf", "file": {}})
+
+        moved = {}
+
+        def patch_handler(req):
+            moved["ok"] = True
+            return httpx.Response(200, json={"id": "srcid", "name": "src.pdf"})
+
+        routes = {
+            **site_drive_routes(),
+            ("GET", "/root:/dst-folder"): httpx.Response(
+                200, json={"id": "dstfolder", "name": "dst-folder", "folder": {}}),
+            ("GET", "/root:/src.pdf"): src_handler,
+            ("PATCH", f"/drives/{FAKE_DRIVE_ID}/items/srcid"): patch_handler,
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend.move("/src.pdf", "/dst-folder/src.pdf")
+
+        assert src_calls["n"] == 2  # retried once
+        assert moved.get("ok") is True
+
+    def test_move_raises_when_source_truly_missing(self, env, fake_token, monkeypatch):
+        """A persistent 404 (genuinely missing source) still fails — after the
+        bounded settle retries, not forever."""
+        monkeypatch.setattr(
+            "tropi_storage.backends.graph_backend.time.sleep", lambda *_: None)
+        routes = {
+            **site_drive_routes(),
+            ("GET", "/root:/dst-folder"): httpx.Response(
+                200, json={"id": "dstfolder", "name": "dst-folder", "folder": {}}),
+            ("GET", "/root:/gone.pdf"): httpx.Response(
+                404, json={"error": {"message": "not found"}}),
+        }
+        backend = make_backend(routes, env, fake_token)
+        with pytest.raises(NotFoundError):
+            backend.move("/gone.pdf", "/dst-folder/gone.pdf")
+
 
 class TestEnsureFolder:
     def test_creates_when_missing(self, env, fake_token):
