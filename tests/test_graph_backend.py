@@ -535,3 +535,48 @@ class TestRetry:
         backend = make_backend(routes, env, fake_token)
         with pytest.raises(ThrottledError):
             backend.read("/foo")
+
+
+class TestKnownFolderCache:
+    def test_second_ensure_skips_existence_gets(self, env, fake_token):
+        """Once a deep path is walked, a second ensure of the same path makes
+        zero existence GETs — the per-segment checks are served from cache."""
+        get_calls = {"n": 0}
+
+        def folder_get(req):
+            get_calls["n"] += 1
+            return httpx.Response(200, json={"id": "f", "name": "seg", "folder": {}})
+
+        routes = {
+            **site_drive_routes(),
+            ("GET", "/root:/a/b/c"): folder_get,
+            ("GET", "/root:/a/b"): folder_get,
+            ("GET", "/root:/a"): folder_get,
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend.ensure_folder("/a/b/c")
+        assert get_calls["n"] == 3  # walked a, b, c once
+        backend.ensure_folder("/a/b/c")
+        assert get_calls["n"] == 3  # fully cached — no new GETs
+
+    def test_delete_invalidates_cache(self, env, fake_token):
+        """Deleting a cached folder forces it (but not its surviving ancestors)
+        to be re-verified on the next ensure."""
+        get_calls = {"n": 0}
+
+        def folder_get(req):
+            get_calls["n"] += 1
+            return httpx.Response(200, json={"id": "f", "name": "seg", "folder": {}})
+
+        routes = {
+            **site_drive_routes(),
+            ("DELETE", "/root:/a/b"): httpx.Response(204),
+            ("GET", "/root:/a/b"): folder_get,
+            ("GET", "/root:/a"): folder_get,
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend.ensure_folder("/a/b")   # GETs a, b → cached
+        assert get_calls["n"] == 2
+        backend.delete("/a/b")          # forgets /a/b, keeps /a
+        backend.ensure_folder("/a/b")   # /a cached, /b re-GET → +1
+        assert get_calls["n"] == 3

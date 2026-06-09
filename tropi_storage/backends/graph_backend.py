@@ -153,6 +153,10 @@ class GraphBackend(StorageAdapter):
         # Both are guarded by a lock because APScheduler threads may call concurrently.
         self._site_id_cache: dict[str, str] = {}
         self._drive_id_cache: dict[tuple[str, str | None], str] = {}
+        # Folders confirmed-present or created during this process, keyed by
+        # (drive_id, item_path). Lets _ensure_folder_recursive skip the
+        # per-segment existence GET for paths it has already walked.
+        self._known_folders: set[tuple[str, str]] = set()
         self._cache_lock = threading.Lock()
 
         # Lock-tracking (used by checkout/checkin).
@@ -479,7 +483,8 @@ class GraphBackend(StorageAdapter):
             try:
                 self._request("DELETE", self._item_url(p))
             except NotFoundError:
-                return  # idempotent
+                pass  # idempotent
+            self._forget_folder(p)
 
     @retry_on_transient(transient_exceptions=_TRANSIENT)
     def move(self, src: str, dst: str) -> None:
@@ -510,6 +515,7 @@ class GraphBackend(StorageAdapter):
             self._request(
                 "PATCH", self._item_id_url(src_drive, src_meta["id"]), json=body
             )
+            self._forget_folder(s)
 
     @retry_on_transient(transient_exceptions=_TRANSIENT)
     def copy(self, src: str, dst: str) -> None:
@@ -557,7 +563,15 @@ class GraphBackend(StorageAdapter):
             self._ensure_folder_recursive(p)
 
     def _ensure_folder_recursive(self, path: str) -> None:
-        """Create each missing folder segment under the correct library drive."""
+        """Create each missing folder segment under the correct library drive.
+
+        Segments confirmed-present or freshly created are remembered in
+        `self._known_folders`, so repeated writes under the same deep tree (e.g.
+        a weekly archive folder receiving many files) skip the per-segment
+        existence GET. The cache is invalidated by delete()/move(); out-of-band
+        deletion of a cached folder is not detected — for these append-only
+        archive trees that does not happen in practice.
+        """
         drive_id, item_path = self._route(path)
         if item_path == "/":
             return  # Library root always exists.
@@ -567,8 +581,14 @@ class GraphBackend(StorageAdapter):
         for seg in segments:
             parent_item_path = current_item_path or "/"
             current_item_path = current_item_path + "/" + seg
+            key = (drive_id, current_item_path)
+            with self._cache_lock:
+                if key in self._known_folders:
+                    continue
             existing = self._get_item_or_none(drive_id, current_item_path)
             if existing and "folder" in existing:
+                with self._cache_lock:
+                    self._known_folders.add(key)
                 continue
             if existing and "file" in existing:
                 raise BackendError(
@@ -584,6 +604,25 @@ class GraphBackend(StorageAdapter):
                 "@microsoft.graph.conflictBehavior": "replace",  # idempotent
             }
             self._request("POST", children_url, json=body)
+            with self._cache_lock:
+                self._known_folders.add(key)
+
+    def _forget_folder(self, path: str) -> None:
+        """Drop `path` and any cached descendants from `_known_folders`.
+
+        Called after delete()/move() so a folder removed in this process is
+        re-verified on the next write instead of wrongly assumed present.
+        """
+        try:
+            drive_id, item_path = self._route(path)
+        except Exception:
+            return
+        prefix = item_path.rstrip("/") + "/"
+        with self._cache_lock:
+            self._known_folders = {
+                k for k in self._known_folders
+                if not (k[0] == drive_id and (k[1] == item_path or k[1].startswith(prefix)))
+            }
 
     def _ensure_parent(self, path: str) -> None:
         parent, _ = split_parent(path)
