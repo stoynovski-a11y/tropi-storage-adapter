@@ -102,6 +102,9 @@ _PATH_SETTLE_RETRIES = 4
 _PATH_SETTLE_BASE = 0.5
 _PATH_SETTLE_CAP = 2.0
 
+_COPY_POLL_START = 0.25   # first sleep after a 202 copy response
+_COPY_POLL_CAP = 2.0      # maximum sleep between poll attempts
+
 
 class GraphBackend(StorageAdapter):
     """SharePoint document library accessed via Microsoft Graph.
@@ -541,6 +544,7 @@ class GraphBackend(StorageAdapter):
 
     def _await_async_op(self, monitor_url: str, timeout_s: float = 120.0) -> None:
         deadline = time.time() + timeout_s
+        delay = _COPY_POLL_START
         while time.time() < deadline:
             resp = self._http.get(monitor_url)
             if resp.status_code == 200:
@@ -551,7 +555,8 @@ class GraphBackend(StorageAdapter):
                     raise BackendError(f"Async op {status}: {resp.text}")
             elif resp.status_code in (201, 303):
                 return
-            time.sleep(1.0)
+            time.sleep(delay)
+            delay = min(delay * 2, _COPY_POLL_CAP)
         raise BackendError(f"Async op did not complete within {timeout_s}s")
 
     @retry_on_transient(transient_exceptions=_TRANSIENT)

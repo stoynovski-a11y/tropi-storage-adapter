@@ -537,6 +537,85 @@ class TestRetry:
             backend.read("/foo")
 
 
+class TestCopyPollDelay:
+    def test_progressive_delay_sequence(self, env, fake_token, monkeypatch):
+        """_await_async_op must use a progressive delay: start at _COPY_POLL_START,
+        double each iteration, cap at _COPY_POLL_CAP (0.25, 0.5, 1.0, 2.0, 2.0, …).
+        """
+        from tropi_storage.backends.graph_backend import (
+            _COPY_POLL_START,
+            _COPY_POLL_CAP,
+        )
+
+        sleep_calls = []
+        monkeypatch.setattr(
+            "tropi_storage.backends.graph_backend.time.sleep",
+            lambda s: sleep_calls.append(s),
+        )
+
+        poll_count = {"n": 0}
+
+        def monitor_handler(req):
+            poll_count["n"] += 1
+            # Respond "inProgress" for the first 5 polls, then "completed".
+            if poll_count["n"] < 6:
+                return httpx.Response(200, json={"status": "inProgress"})
+            return httpx.Response(200, json={"status": "completed"})
+
+        # Wire the monitor URL directly — copy() would normally hand it off.
+        routes = {
+            **site_drive_routes(),
+            ("GET", "monitor-op-123"): monitor_handler,
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend._await_async_op("https://graph.microsoft.com/v1.0/monitor-op-123")
+
+        # Six polls total; the last one returns "completed" → no trailing sleep.
+        assert poll_count["n"] == 6
+        assert len(sleep_calls) == 5  # five "still in progress" polls each slept
+
+        # Progressive: 0.25, 0.5, 1.0, 2.0, 2.0 (capped)
+        assert sleep_calls[0] == _COPY_POLL_START
+        assert sleep_calls[1] == min(_COPY_POLL_START * 2, _COPY_POLL_CAP)
+        assert sleep_calls[2] == min(_COPY_POLL_START * 4, _COPY_POLL_CAP)
+        assert sleep_calls[3] == _COPY_POLL_CAP
+        assert sleep_calls[4] == _COPY_POLL_CAP  # stays capped
+
+    def test_copy_poll_immediate_complete(self, env, fake_token, monkeypatch):
+        """When Graph returns 'completed' on the first poll, no sleep at all."""
+        sleep_calls = []
+        monkeypatch.setattr(
+            "tropi_storage.backends.graph_backend.time.sleep",
+            lambda s: sleep_calls.append(s),
+        )
+
+        routes = {
+            **site_drive_routes(),
+            ("GET", "monitor-fast"): httpx.Response(200, json={"status": "completed"}),
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend._await_async_op("https://graph.microsoft.com/v1.0/monitor-fast")
+
+        assert sleep_calls == []
+
+    def test_copy_poll_303_no_sleep(self, env, fake_token, monkeypatch):
+        """A 303 redirect response is treated as immediate completion."""
+        sleep_calls = []
+        monkeypatch.setattr(
+            "tropi_storage.backends.graph_backend.time.sleep",
+            lambda s: sleep_calls.append(s),
+        )
+
+        routes = {
+            **site_drive_routes(),
+            ("GET", "monitor-303"): httpx.Response(303),
+        }
+        backend = make_backend(routes, env, fake_token)
+        backend._await_async_op("https://graph.microsoft.com/v1.0/monitor-303")
+
+        assert sleep_calls == []
+
+
 class TestKnownFolderCache:
     def test_second_ensure_skips_existence_gets(self, env, fake_token):
         """Once a deep path is walked, a second ensure of the same path makes
