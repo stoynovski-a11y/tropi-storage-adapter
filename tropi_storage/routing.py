@@ -101,6 +101,52 @@ def load_routes() -> dict[str, tuple[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# load_folder_pins
+# ---------------------------------------------------------------------------
+
+def load_folder_pins() -> dict[str, str]:
+    """Return the folder-ID pin table from the optional ``M365_FOLDER_IDS`` env var.
+
+    Maps a logical folder path (the location callers still reference) to a Graph
+    driveItem id::
+
+        M365_FOLDER_IDS='{"/Legacy/Top A/Old Name": "01ABC...", ...}'
+
+    The backend addresses a pinned folder — and everything beneath it — by that
+    stable id instead of by name, so the folder can be renamed or moved within
+    its drive without breaking any caller. Empty/unset → no pins (normal
+    name-based addressing).
+
+    Raises BackendError if set but not a JSON object of string→non-empty-string.
+    Keys are normalised; matching against item paths happens in the backend.
+    """
+    env_val = os.getenv("M365_FOLDER_IDS", "").strip()
+    if not env_val:
+        return {}
+
+    try:
+        data = json.loads(env_val)
+    except json.JSONDecodeError as exc:
+        raise BackendError(f"M365_FOLDER_IDS is not valid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise BackendError(
+            "M365_FOLDER_IDS must be a JSON object mapping a logical folder "
+            "path to a driveItem id string; got a non-object value."
+        )
+
+    pins: dict[str, str] = {}
+    for key, val in data.items():
+        if not isinstance(val, str) or not val:
+            raise BackendError(
+                f"M365_FOLDER_IDS entry {key!r} must map to a non-empty "
+                f"driveItem id string; got {val!r}."
+            )
+        pins[normalize_path(key)] = val
+    return pins
+
+
+# ---------------------------------------------------------------------------
 # resolve_route
 # ---------------------------------------------------------------------------
 
