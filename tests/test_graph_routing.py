@@ -13,7 +13,13 @@ import pytest
 
 from tropi_storage.backends.graph_backend import GraphBackend
 from tropi_storage.exceptions import BackendError
-from tropi_storage.routing import DEFAULT_ROUTES, load_routes, load_strip_prefix, resolve_route
+from tropi_storage.routing import (
+    DEFAULT_ROUTES,
+    load_folder_pins,
+    load_routes,
+    load_strip_prefix,
+    resolve_route,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers (same pattern as test_graph_backend.py)
@@ -422,3 +428,51 @@ class TestLoadStripPrefix:
     def test_env_value_stripped_of_whitespace(self, monkeypatch):
         monkeypatch.setenv("M365_STRIP_PREFIX", "  /Legacy  ")
         assert load_strip_prefix() == "/Legacy"
+
+
+# ---------------------------------------------------------------------------
+# 8. load_folder_pins tests
+# ---------------------------------------------------------------------------
+
+class TestLoadFolderPins:
+    def test_env_unset_returns_empty(self, monkeypatch):
+        monkeypatch.delenv("M365_FOLDER_IDS", raising=False)
+        assert load_folder_pins() == {}
+
+    def test_env_empty_string_returns_empty(self, monkeypatch):
+        monkeypatch.setenv("M365_FOLDER_IDS", "")
+        assert load_folder_pins() == {}
+
+    def test_parses_and_normalises_keys(self, monkeypatch):
+        monkeypatch.setenv(
+            "M365_FOLDER_IDS",
+            '{"/Top A/Old Name/": "01ABC", "Top B/x": "01DEF"}',
+        )
+        pins = load_folder_pins()
+        # Trailing slash dropped, leading slash added — both via normalize_path.
+        assert pins == {"/Top A/Old Name": "01ABC", "/Top B/x": "01DEF"}
+
+    def test_preserves_internal_double_space(self, monkeypatch):
+        # The real ЕКО folder has a double space; normalize_path must not eat it.
+        monkeypatch.setenv("M365_FOLDER_IDS", '{"/A/06  EKO": "01XYZ"}')
+        assert load_folder_pins() == {"/A/06  EKO": "01XYZ"}
+
+    def test_invalid_json_raises(self, monkeypatch):
+        monkeypatch.setenv("M365_FOLDER_IDS", "not-json{")
+        with pytest.raises(BackendError, match="not valid JSON"):
+            load_folder_pins()
+
+    def test_non_object_raises(self, monkeypatch):
+        monkeypatch.setenv("M365_FOLDER_IDS", '["oops"]')
+        with pytest.raises(BackendError, match="JSON object"):
+            load_folder_pins()
+
+    def test_non_string_value_raises(self, monkeypatch):
+        monkeypatch.setenv("M365_FOLDER_IDS", '{"/A": 123}')
+        with pytest.raises(BackendError, match="non-empty"):
+            load_folder_pins()
+
+    def test_empty_value_raises(self, monkeypatch):
+        monkeypatch.setenv("M365_FOLDER_IDS", '{"/A": ""}')
+        with pytest.raises(BackendError, match="non-empty"):
+            load_folder_pins()

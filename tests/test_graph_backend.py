@@ -659,3 +659,82 @@ class TestKnownFolderCache:
         backend.delete("/a/b")          # forgets /a/b, keeps /a
         backend.ensure_folder("/a/b")   # /a cached, /b re-GET → +1
         assert get_calls["n"] == 3
+
+
+class TestFolderPins:
+    """M365_FOLDER_IDS addresses a pinned folder (and its subtree) by item id."""
+
+    def _pin_routes(self):
+        return {
+            ("GET", "/sites/x.sharepoint.com:/sites/alpha"): httpx.Response(
+                200, json={"id": "alpha-site", "name": "alpha"}),
+            ("GET", "/sites/alpha-site/drives"): httpx.Response(
+                200, json={"value": [{"id": "alpha-drive", "name": "LibA"}]}),
+        }
+
+    def test_read_under_pin_addresses_by_item_id(self, env, fake_token, monkeypatch):
+        monkeypatch.setenv("M365_ROUTES", '{"TopA": ["/sites/alpha", "LibA"]}')
+        monkeypatch.setenv("M365_FOLDER_IDS", '{"/TopA/Anchor": "PIN123"}')
+        captured = {}
+
+        def content_handler(req):
+            captured["url"] = str(req.url)
+            return httpx.Response(200, content=b"pinned-bytes")
+
+        routes = {**self._pin_routes(), ("GET", "/items/PIN123:"): content_handler}
+        backend = make_backend(routes, env, fake_token)
+        assert backend.read("/TopA/Anchor/child.xlsx") == b"pinned-bytes"
+        # Addressed by item id with the sub-path under the pin — NOT by name.
+        assert "/items/PIN123:/child.xlsx:/content" in captured["url"]
+        assert "/root:/Anchor" not in captured["url"]
+
+    def test_pinned_folder_itself_uses_item_id(self, env, fake_token, monkeypatch):
+        monkeypatch.setenv("M365_ROUTES", '{"TopA": ["/sites/alpha", "LibA"]}')
+        monkeypatch.setenv("M365_FOLDER_IDS", '{"/TopA/Anchor": "PIN123"}')
+        captured = {}
+
+        def item_handler(req):
+            captured["url"] = str(req.url)
+            return httpx.Response(200, json={
+                "id": "PIN123", "name": "RenamedAnchor", "folder": {},
+                "lastModifiedDateTime": "2026-06-15T00:00:00Z",
+                "parentReference": {"path": "/drive/root:/sub"}})
+
+        routes = {**self._pin_routes(), ("GET", "/items/PIN123"): item_handler}
+        backend = make_backend(routes, env, fake_token)
+        meta = backend.get_metadata("/TopA/Anchor")
+        assert meta["exists"] is True
+        # The pinned folder is fetched by /items/{id} even though its real name
+        # ("RenamedAnchor") differs from the requested name ("Anchor").
+        assert "/items/PIN123" in captured["url"]
+        assert "/root:/Anchor" not in captured["url"]
+
+    def test_unpinned_sibling_still_uses_root(self, env, fake_token, monkeypatch):
+        monkeypatch.setenv("M365_ROUTES", '{"TopA": ["/sites/alpha", "LibA"]}')
+        monkeypatch.setenv("M365_FOLDER_IDS", '{"/TopA/Anchor": "PIN123"}')
+        captured = {}
+
+        def content_handler(req):
+            captured["url"] = str(req.url)
+            return httpx.Response(200, content=b"x")
+
+        routes = {**self._pin_routes(), ("GET", "/content"): content_handler}
+        backend = make_backend(routes, env, fake_token)
+        backend.read("/TopA/Other/child.xlsx")
+        # A path NOT under the pin keeps normal root:/name addressing.
+        assert "/root:/Other/child.xlsx:/content" in captured["url"]
+        assert "/items/PIN123" not in captured["url"]
+
+    def test_no_pins_is_unchanged(self, env, fake_token, monkeypatch):
+        monkeypatch.setenv("M365_ROUTES", '{"TopA": ["/sites/alpha", "LibA"]}')
+        monkeypatch.delenv("M365_FOLDER_IDS", raising=False)
+        captured = {}
+
+        def content_handler(req):
+            captured["url"] = str(req.url)
+            return httpx.Response(200, content=b"x")
+
+        routes = {**self._pin_routes(), ("GET", "/content"): content_handler}
+        backend = make_backend(routes, env, fake_token)
+        backend.read("/TopA/Anchor/child.xlsx")
+        assert "/root:/Anchor/child.xlsx:/content" in captured["url"]

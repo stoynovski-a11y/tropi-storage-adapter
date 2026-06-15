@@ -37,7 +37,7 @@ from ..exceptions import (
 from ..logging_config import log_operation
 from ..path_utils import normalize_path, split_parent
 from ..retry import retry_on_transient
-from ..routing import load_routes, load_strip_prefix, resolve_route
+from ..routing import load_folder_pins, load_routes, load_strip_prefix, resolve_route
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = ["https://graph.microsoft.com/.default"]
@@ -170,6 +170,14 @@ class GraphBackend(StorageAdapter):
 
         # Optional legacy-prefix to strip from every path before routing.
         self._strip_prefix = load_strip_prefix()
+
+        # Optional folder-ID pins: logical folder path → driveItem id. A path
+        # under a pinned folder is addressed by item id instead of by name, so
+        # the folder surviving a rename/move (within its drive) does not break
+        # callers. Resolved per-drive lazily in _pins_for_drive; empty unless
+        # M365_FOLDER_IDS is set, in which case addressing is unchanged.
+        self._folder_pins = load_folder_pins()
+        self._pins_by_drive: dict[str, list[tuple[str, str]]] = {}
 
     # --- auth --------------------------------------------------------------
     def _get_msal(self) -> msal.ConfidentialClientApplication:
@@ -305,15 +313,58 @@ class GraphBackend(StorageAdapter):
         """Encode a folder/file path for use after ``root:``."""
         return urllib.parse.quote(path.lstrip("/"), safe="/")
 
+    def _pins_for_drive(self, drive_id: str) -> list[tuple[str, str]]:
+        """Return [(anchor_item_path, item_id)] for pins that live in *drive_id*.
+
+        Each configured pin's logical path is routed to (site, library) → drive
+        id; the ones whose drive matches *drive_id* are kept with their
+        drive-relative anchor path. Pins not routable on this service are
+        skipped — the same M365_FOLDER_IDS value is shared across services whose
+        route tables differ. Resolved once per drive and cached.
+        """
+        with self._cache_lock:
+            cached = self._pins_by_drive.get(drive_id)
+        if cached is not None:
+            return cached
+
+        resolved: list[tuple[str, str]] = []
+        for anchor_logical, item_id in self._folder_pins.items():
+            try:
+                site_path, drive_name, anchor_item_path = resolve_route(
+                    anchor_logical, self._routes, self._default_site_path,
+                    self._default_drive_name, strip_prefix=self._strip_prefix,
+                )
+                if self._resolve_drive_id(site_path, drive_name) == drive_id:
+                    resolved.append((normalize_path(anchor_item_path), item_id))
+            except Exception:
+                continue
+        with self._cache_lock:
+            self._pins_by_drive[drive_id] = resolved
+        return resolved
+
     def _build_item_url(self, drive_id: str, item_path: str, suffix: str = "") -> str:
-        """Return a /drives/{drive_id}/root[:/path][:suffix] URL fragment."""
+        """Return a /drives/{drive_id}/{base}[:/path][:suffix] URL fragment.
+
+        *base* is normally ``root`` but becomes ``items/{id}`` when *item_path*
+        falls under a folder pinned via M365_FOLDER_IDS, addressing that subtree
+        by stable id (rename/move-proof) instead of by name. *rel* is the path
+        beneath the pin ("/" when *item_path* IS the pinned folder).
+        """
         p = normalize_path(item_path)
-        if p == "/":
-            return f"/drives/{drive_id}/root{suffix}"
-        enc = self._encode_path(p)
+        base, rel = "root", p
+        for anchor, item_id in self._pins_for_drive(drive_id):
+            if p == anchor:
+                base, rel = f"items/{item_id}", "/"
+                break
+            if anchor != "/" and p.startswith(anchor + "/"):
+                base, rel = f"items/{item_id}", p[len(anchor):]
+                break
+        if rel == "/":
+            return f"/drives/{drive_id}/{base}{suffix}"
+        enc = self._encode_path(rel)
         if suffix:
-            return f"/drives/{drive_id}/root:/{enc}:{suffix}"
-        return f"/drives/{drive_id}/root:/{enc}"
+            return f"/drives/{drive_id}/{base}:/{enc}:{suffix}"
+        return f"/drives/{drive_id}/{base}:/{enc}"
 
     def _item_url(self, path: str, suffix: str = "") -> str:
         """Route *path* then build /drives/{id}/root:/path:[suffix]."""
