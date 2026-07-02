@@ -129,5 +129,18 @@ def init_sentry_if_configured() -> bool:
     except ImportError:
         get_logger().warning("SENTRY_DSN set but sentry-sdk not installed; skipping")
         return False
-    sentry_sdk.init(dsn=dsn, traces_sample_rate=0.05, send_default_pii=False)
+    # Init exactly once: get_adapter() calls this on every invocation, and concurrent
+    # re-inits race inside sentry_sdk's auto-enabling integration imports (a failed
+    # integration import is retried on every init and is not thread-safe — seen live
+    # as "cannot import name 'LangchainIntegration'" when a poll thread collided with
+    # an APScheduler job). auto_enabling_integrations=False: the adapter only needs
+    # plain error reporting, and the host service's own init decides integrations.
+    if sentry_sdk.is_initialized():
+        return True
+    sentry_sdk.init(
+        dsn=dsn,
+        traces_sample_rate=0.05,
+        send_default_pii=False,
+        auto_enabling_integrations=False,
+    )
     return True
